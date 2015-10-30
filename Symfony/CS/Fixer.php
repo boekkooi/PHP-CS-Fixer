@@ -11,13 +11,14 @@
 
 namespace Symfony\CS;
 
-use SebastianBergmann\Diff\Differ;
 use Symfony\Component\EventDispatcher\Event;
 use Symfony\Component\EventDispatcher\EventDispatcher;
 use Symfony\Component\Filesystem\Exception\IOException;
 use Symfony\Component\Finder\Finder;
 use Symfony\Component\Finder\SplFileInfo as FinderSplFileInfo;
 use Symfony\Component\Stopwatch\Stopwatch;
+use Symfony\CS\Differ\DiffDiffer;
+use Symfony\CS\Differ\DifferInterface;
 use Symfony\CS\Error\Error;
 use Symfony\CS\Error\ErrorsManager;
 use Symfony\CS\Linter\LinterInterface;
@@ -34,13 +35,6 @@ class Fixer
     const VERSION = '2.0-DEV';
 
     protected $configs = array();
-
-    /**
-     * Differ instance.
-     *
-     * @var Differ
-     */
-    protected $diff;
 
     /**
      * EventDispatcher instance.
@@ -72,7 +66,6 @@ class Fixer
 
     public function __construct()
     {
-        $this->diff = new Differ();
         $this->errorsManager = new ErrorsManager();
         $this->linter = new NullLinter();
         $this->stopwatch = new Stopwatch();
@@ -267,8 +260,9 @@ class Fixer
 
             $fixInfo = array('appliedFixers' => $appliedFixers);
 
-            if ($diff) {
-                $fixInfo['diff'] = $this->stringDiff($old, $new);
+            $differ = $this->resolveDiffer($diff);
+            if ($differ) {
+                $fixInfo['diff'] = $differ->diff($old, $new);
             }
         }
 
@@ -291,29 +285,19 @@ class Fixer
         return $file->getPathname();
     }
 
-    protected function stringDiff($old, $new)
+    private function resolveDiffer($differ)
     {
-        $diff = $this->diff->diff($old, $new);
+        if ($differ === false || $differ === null) {
+            return null;
+        }
+        if ($differ === true) {
+            return new DiffDiffer();
+        }
+        if ($differ instanceof DifferInterface) {
+            return $differ;
+        }
 
-        $diff = implode(
-            PHP_EOL,
-            array_map(
-                function ($string) {
-                    $string = preg_replace('/^(\+){3}/', '<info>+++</info>', $string);
-                    $string = preg_replace('/^(\+){1}/', '<info>+</info>', $string);
-
-                    $string = preg_replace('/^(\-){3}/', '<error>---</error>', $string);
-                    $string = preg_replace('/^(\-){1}/', '<error>-</error>', $string);
-
-                    $string = str_repeat(' ', 6).$string;
-
-                    return $string;
-                },
-                explode(PHP_EOL, $diff)
-            )
-        );
-
-        return $diff;
+        throw new \InvalidArgumentException();
     }
 
     /**
