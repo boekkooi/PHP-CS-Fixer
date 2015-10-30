@@ -13,18 +13,16 @@ namespace Symfony\CS;
 
 use Symfony\Component\EventDispatcher\Event;
 use Symfony\Component\EventDispatcher\EventDispatcher;
-use Symfony\Component\Filesystem\Exception\IOException;
 use Symfony\Component\Finder\Finder;
 use Symfony\Component\Finder\SplFileInfo as FinderSplFileInfo;
 use Symfony\Component\Stopwatch\Stopwatch;
 use Symfony\CS\Differ\DiffDiffer;
 use Symfony\CS\Differ\DifferInterface;
+use Symfony\CS\Differ\NullDiffer;
 use Symfony\CS\Error\Error;
 use Symfony\CS\Error\ErrorsManager;
 use Symfony\CS\Linter\LinterInterface;
-use Symfony\CS\Linter\LintingException;
 use Symfony\CS\Linter\NullLinter;
-use Symfony\CS\Tokenizer\Tokens;
 
 /**
  * @author Fabien Potencier <fabien@symfony.com>
@@ -153,127 +151,45 @@ class Fixer
 
     public function fixFile(\SplFileInfo $file, array $fixers, $dryRun, $diff, FileCacheManager $fileCacheManager)
     {
-        $new = $old = file_get_contents($file->getRealpath());
+        $fileFixer = new FileFixer($fileCacheManager, $this->linter, $this->resolveDiffer($diff));
+        $result = $fileFixer->execute($fixers, $file, $dryRun);
 
-        if (
-            '' === $old
-            || !$fileCacheManager->needFixing($this->getFileRelativePathname($file), $old)
-            // PHP 5.3 has a broken implementation of token_get_all when the file uses __halt_compiler() starting in 5.3.6
-            || (PHP_VERSION_ID >= 50306 && PHP_VERSION_ID < 50400 && false !== stripos($old, '__halt_compiler()'))
-        ) {
-            $this->dispatchEvent(
-                FixerFileProcessedEvent::NAME,
-                FixerFileProcessedEvent::create()->setStatus(FixerFileProcessedEvent::STATUS_SKIPPED)
+        $this->dispatchEvent(
+            FixerFileProcessedEvent::NAME,
+            FixerFileProcessedEvent::create()->setStatus($result->getStatus())
+        );
+
+        if ($result->getStatus() === FileResult::STATUS_FIXED) {
+            $fixInfo = array(
+                'appliedFixers' => $result->getAppliedFixers(),
             );
-
-            return;
-        }
-
-        try {
-            $this->linter->lintFile($file->getRealpath());
-        } catch (LintingException $e) {
-            $this->dispatchEvent(
-                FixerFileProcessedEvent::NAME,
-                FixerFileProcessedEvent::create()->setStatus(FixerFileProcessedEvent::STATUS_INVALID)
-            );
-
-            $this->errorsManager->report(new Error(
-                Error::TYPE_INVALID,
-                $this->getFileRelativePathname($file)
-            ));
-
-            return;
-        }
-
-        $old = file_get_contents($file->getRealpath());
-        $appliedFixers = array();
-
-        // we do not need Tokens to still caching previously fixed file - so clear the cache
-        Tokens::clearCache();
-
-        $tokens = Tokens::fromCode($old);
-        $newHash = $oldHash = $tokens->getCodeHash();
-
-        try {
-            foreach ($fixers as $fixer) {
-                if (!$fixer->supports($file) || !$fixer->isCandidate($tokens)) {
-                    continue;
-                }
-
-                $fixer->fix($file, $tokens);
-
-                if ($tokens->isChanged()) {
-                    $tokens->clearEmptyTokens();
-                    $tokens->clearChanged();
-                    $appliedFixers[] = $fixer->getName();
-                }
+            if ($diff) {
+                $fixInfo['diff'] = $result->getCodeDiff();
             }
-        } catch (\Exception $e) {
-            $this->dispatchEvent(
-                FixerFileProcessedEvent::NAME,
-                FixerFileProcessedEvent::create()->setStatus(FixerFileProcessedEvent::STATUS_EXCEPTION)
-            );
 
-            $this->errorsManager->report(new Error(
-                Error::TYPE_EXCEPTION,
-                $this->getFileRelativePathname($file)
-            ));
-
-            return;
+            return $fixInfo;
         }
 
-        $fixInfo = null;
-
-        if (!empty($appliedFixers)) {
-            $new = $tokens->generateCode();
-            $newHash = $tokens->getCodeHash();
-        }
-
-        // We need to check if content was changed and then applied changes.
-        // But we can't simple check $appliedFixers, because one fixer may revert
-        // work of other and both of them will mark collection as changed.
-        // Therefore we need to check if code hashes changed.
-        if ($oldHash !== $newHash) {
-            try {
-                $this->linter->lintSource($new);
-            } catch (LintingException $e) {
-                $this->dispatchEvent(
-                    FixerFileProcessedEvent::NAME,
-                    FixerFileProcessedEvent::create()->setStatus(FixerFileProcessedEvent::STATUS_LINT)
-                );
-
+        switch ($result->getStatus()) {
+            case FileResult::STATUS_LINT:
                 $this->errorsManager->report(new Error(
                     Error::TYPE_LINT,
                     $this->getFileRelativePathname($file)
                 ));
-
-                return;
-            }
-
-            if (!$dryRun && false === @file_put_contents($file->getRealpath(), $new)) {
-                $error = error_get_last();
-                if ($error) {
-                    throw new IOException(sprintf('Failed to write file "%s", "%s".', $file->getRealpath(), $error['message']), 0, null, $file->getRealpath());
-                }
-                throw new IOException(sprintf('Failed to write file "%s".', $file->getRealpath()), 0, null, $file->getRealpath());
-            }
-
-            $fixInfo = array('appliedFixers' => $appliedFixers);
-
-            $differ = $this->resolveDiffer($diff);
-            if ($differ) {
-                $fixInfo['diff'] = $differ->diff($old, $new);
-            }
+                break;
+            case FileResult::STATUS_EXCEPTION:
+                $this->errorsManager->report(new Error(
+                    Error::TYPE_EXCEPTION,
+                    $this->getFileRelativePathname($file)
+                ));
+                break;
+            case FileResult::STATUS_INVALID:
+                $this->errorsManager->report(new Error(
+                    Error::TYPE_INVALID,
+                    $this->getFileRelativePathname($file)
+                ));
+                break;
         }
-
-        $fileCacheManager->setFile($this->getFileRelativePathname($file), $new);
-
-        $this->dispatchEvent(
-            FixerFileProcessedEvent::NAME,
-            FixerFileProcessedEvent::create()->setStatus($fixInfo ? FixerFileProcessedEvent::STATUS_FIXED : FixerFileProcessedEvent::STATUS_NO_CHANGES)
-        );
-
-        return $fixInfo;
     }
 
     private function getFileRelativePathname(\SplFileInfo $file)
@@ -288,7 +204,7 @@ class Fixer
     private function resolveDiffer($differ)
     {
         if ($differ === false || $differ === null) {
-            return null;
+            return new NullDiffer();
         }
         if ($differ === true) {
             return new DiffDiffer();
