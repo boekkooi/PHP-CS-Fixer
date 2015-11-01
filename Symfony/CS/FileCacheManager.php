@@ -103,13 +103,13 @@ final class FileCacheManager
         return $result;
     }
 
-    private function isCacheStale($cacheVersion, $rules)
+    private function isCacheStale($phpVersion, $cacheVersion, $rules)
     {
         if (!$this->isCacheAvailable()) {
             return true;
         }
 
-        return ToolInfo::getVersion() !== $cacheVersion || $this->rules !== $rules;
+        return $phpVersion !== PHP_VERSION ||ToolInfo::getVersion() !== $cacheVersion || $this->rules !== $rules;
     }
 
     private function readFromFile()
@@ -125,12 +125,12 @@ final class FileCacheManager
         $content = file_get_contents($this->cacheFile);
         $data = unserialize($content);
 
-        if (!isset($data['version']) || !isset($data['rules'])) {
+        if (!isset($data['php_version']) || !isset($data['version']) || !isset($data['rules'])) {
             return;
         }
 
         // Set hashes only if the cache is fresh, otherwise we need to parse all files
-        if (!$this->isCacheStale($data['version'], $data['rules'])) {
+        if (!$this->isCacheStale($data['php_version'], $data['version'], $data['rules'])) {
             $this->oldHashes = $data['hashes'];
         }
     }
@@ -143,6 +143,7 @@ final class FileCacheManager
 
         $data = serialize(
             array(
+                'php_version' => PHP_VERSION_ID,
                 'version' => ToolInfo::getVersion(),
                 'rules' => $this->rules,
                 'hashes' => $this->newHashes,
